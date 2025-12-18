@@ -1,5 +1,6 @@
 #!/var/ossec/framework/python/bin/python3
-# Copyright (C) 2015-2022, Wazuh Inc.
+# URLhaus integration for Wazuh + Suricata EVE JSON
+# Safe against missing fields and mixed event types.
 
 import json
 import sys
@@ -9,166 +10,164 @@ from socket import socket, AF_UNIX, SOCK_DGRAM
 
 try:
     import requests
-    from requests.auth import HTTPBasicAuth
-except Exception as e:
-    print("No module 'requests' found. Install: pip install requests")
+except Exception:
+    print("No module 'requests' found. Install: /var/ossec/framework/python/bin/python3 -m pip install requests")
     sys.exit(1)
-
-# Global vars
 
 debug_enabled = True
 pwd = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-json_alert = {}
 now = time.strftime("%a %b %d %H:%M:%S %Z %Y")
 
-# Set paths
-log_file = '{0}/logs/integrations.log'.format(pwd)
-socket_addr = '{0}/queue/sockets/queue'.format(pwd)
-
-def main(args):
-    debug("# Starting")
-
-    # Read args
-    alert_file_location = args[1]
-
-    debug("# File location")
-    debug(alert_file_location)
-
-    # Load alert. Parse JSON object.
-    with open(alert_file_location) as alert_file:
-        json_alert = json.load(alert_file)
-    debug("# Processing alert")
-    debug(json_alert)
-
-    # Request urlhaus info
-    msg = request_urlhaus_info(json_alert)
-
-    # If positive match, send event to Wazuh Manager
-    if msg:
-        send_event(msg, json_alert["agent"])
+log_file = f"{pwd}/logs/integrations.log"
+socket_addr = f"{pwd}/queue/sockets/queue"
+urlhaus_endpoint = "https://urlhaus-api.abuse.ch/v1/url/"
 
 def debug(msg):
-    if debug_enabled:
-        msg = "{0}: {1}\n".format(now, msg)
+    if not debug_enabled:
+        return
+    line = f"{now}: {msg}\n"
+    print(line)
+    with open(log_file, "a", encoding="utf-8") as f:
+        f.write(line)
 
-        print(msg)
+def extract_url_from_alert(alert):
+    data = alert.get("data", {})
 
-        f = open(log_file,"a")
-        f.write(msg)
-        f.close()
+    # Legacy format some blog posts use (proxy/web logs)
+    http_old = data.get("http", {})
+    if isinstance(http_old, dict):
+        redirect = http_old.get("redirect")
+        if redirect:
+            return redirect
 
-def collect(data):
-  urlhaus_reference = data['urlhaus_reference']
-  url_status = data['url_status']
-  url_date_added = data['date_added']
-  url_threat = data['threat']
-  url_blacklist_spamhaus = data['blacklists']['spamhaus_dbl']
-  url_blacklist_surbl = data['blacklists']['surbl']
-  url_tags = data['tags']
-  return urlhaus_reference, url_status, url_date_added, url_threat, url_blacklist_spamhaus, url_blacklist_surbl, url_tags
+    # Suricata EVE format in Wazuh
+    suri = data.get("suricata", {})
+    if not isinstance(suri, dict):
+        return None
 
-def in_database(data, url):
-  result = data['query_status']
-  debug(result)
-  if result == "ok":
-    return True
-  return False
+    eve = suri.get("eve", {})
+    if not isinstance(eve, dict):
+        return None
 
-def query_api(url):
-  params = {'url': url}
-  response = requests.post('https://urlhaus-api.abuse.ch/v1/url/', params)
-  json_response = response.json()
-  if json_response['query_status'] == 'ok':
-      data = json_response
-      debug(data)
-      return data
-  else:
-      alert_output = {}
-      alert_output["urlhaus"] = {}
-      alert_output["integration"] = "custom-urlhaus"
-      json_response = response.json()
-      debug("# Error: The URLHAUS integration encountered an error")
-      alert_output["urlhaus"]["error"] = response.status_code
-      alert_output["urlhaus"]["description"] = json_response["errors"][0]["detail"]
-      send_event(alert_output)
-      exit(0)
+    http = eve.get("http", {})
+    if not isinstance(http, dict):
+        return None
 
-def request_urlhaus_info(alert):
-    alert_output = {}
-    # If there is no url address present in the alert. Exit.
-    if alert["data"]["http"]["redirect"] == None:
-      return(0)
+    host = http.get("hostname") or http.get("host")
+    path = http.get("url") or http.get("uri")
 
-    # Request info using urlhaus API
-    data = query_api(alert["data"]["http"]["redirect"])
+    if host and path:
+        if path.startswith("http://") or path.startswith("https://"):
+            return path
+        if path.startswith("/"):
+            return f"http://{host}{path}"
+        return f"http://{host}/{path}"
 
-    # Create alert
-    alert_output["urlhaus"] = {}
-    alert_output["integration"] = "custom-urlhaus"
-    alert_output["urlhaus"]["found"] = 0
-    alert_output["urlhaus"]["source"] = {}
-    alert_output["urlhaus"]["source"]["alert_id"] = alert["id"]
-    alert_output["urlhaus"]["source"]["rule"] = alert["rule"]["id"]
-    alert_output["urlhaus"]["source"]["description"] = alert["rule"]["description"]
-    alert_output["urlhaus"]["source"]["url"] = alert["data"]["http"]["redirect"]
-    url = alert["data"]["http"]["redirect"]
-    # Check if urlhaus has any info about the url
-    if in_database(data, url):
-      alert_output["urlhaus"]["found"] = 1
+    return None
 
-    # Info about the url found in urlhaus
-    if alert_output["urlhaus"]["found"] == 1:
-        urlhaus_reference, url_status, url_date_added, url_threat, url_blacklist_spamhaus, url_blacklist_surbl, url_tags = collect(data)
+def query_urlhaus(url):
+    try:
+        response = requests.post(urlhaus_endpoint, data={"url": url}, timeout=8)
+        return response.status_code, response.json()
+    except Exception as e:
+        debug(f"# URLhaus request failed: {e}")
+        return 0, {"query_status": "error"}
 
-        # Populate JSON Output object with urlhaus request
-        alert_output["urlhaus"]["urlhaus_reference"] = urlhaus_reference
-        alert_output["urlhaus"]["url_status"] = url_status
-        alert_output["urlhaus"]["url_date_added"] = url_date_added
-        alert_output["urlhaus"]["url_threat"] = url_threat
-        alert_output["urlhaus"]["url_blacklist_spamhaus"] = url_blacklist_spamhaus
-        alert_output["urlhaus"]["url_blacklist_surbl"] = url_blacklist_surbl
-        alert_output["urlhaus"]["url_tags"] = url_tags
+def in_database(json_response):
+    return json_response.get("query_status") == "ok"
 
+def collect(json_response):
+    urlhaus_reference = json_response.get("urlhaus_reference")
+    url_status = json_response.get("url_status")
+    date_added = json_response.get("date_added")
+    threat = json_response.get("threat")
+    blacklists = json_response.get("blacklists", {}) if isinstance(json_response.get("blacklists", {}), dict) else {}
+    spamhaus_dbl = blacklists.get("spamhaus_dbl")
+    surbl = blacklists.get("surbl")
+    tags = json_response.get("tags")
+    host = json_response.get("host")
+    return urlhaus_reference, url_status, date_added, threat, spamhaus_dbl, surbl, tags, host
 
-    debug(alert_output)
+def build_output(alert, url, json_response):
+    out = {
+        "integration": "urlhaus",
+        "urlhaus": {
+            "found": 0,
+            "source": {
+                "alert_id": alert.get("id"),
+                "rule": alert.get("rule", {}).get("id"),
+                "description": alert.get("rule", {}).get("description"),
+                "url": url
+            }
+        }
+    }
 
-    return(alert_output)
+    if not in_database(json_response):
+        return None
 
-def send_event(msg, agent = None):
-    if not agent or agent["id"] == "000":
-        string = '1:urlhaus:{0}'.format(json.dumps(msg))
+    out["urlhaus"]["found"] = 1
+    urlhaus_reference, url_status, date_added, threat, spamhaus_dbl, surbl, tags, host = collect(json_response)
+
+    out["urlhaus"]["urlhaus_reference"] = urlhaus_reference
+    out["urlhaus"]["url_status"] = url_status
+    out["urlhaus"]["date_added"] = date_added
+    out["urlhaus"]["threat"] = threat
+    out["urlhaus"]["blacklists"] = {"spamhaus_dbl": spamhaus_dbl, "surbl": surbl}
+    out["urlhaus"]["tags"] = tags
+    out["urlhaus"]["host"] = host
+
+    return out
+
+def send_event(msg, agent=None):
+    if not agent or agent.get("id") == "000":
+        string = f"1:urlhaus:{json.dumps(msg)}"
     else:
-        string = '1:[{0}] ({1}) {2}->urlhaus:{3}'.format(agent["id"], agent["name"], agent["ip"] if "ip" in agent else "any", json.dumps(msg))
+        agent_id = agent.get("id", "000")
+        agent_name = agent.get("name", "unknown")
+        agent_ip = agent.get("ip", "any")
+        string = f"1:[{agent_id}] ({agent_name}) {agent_ip}->urlhaus:{json.dumps(msg)}"
 
-    debug(string)
+    debug(f"# Sending event: {string}")
+
     sock = socket(AF_UNIX, SOCK_DGRAM)
     sock.connect(socket_addr)
     sock.send(string.encode())
     sock.close()
 
+def main(args):
+    debug("# Starting URLhaus integration")
+
+    if len(args) < 2:
+        debug("# Exiting: Missing alert file argument")
+        sys.exit(1)
+
+    alert_file_location = args[1]
+    debug(f"# Alert file: {alert_file_location}")
+
+    with open(alert_file_location, "r", encoding="utf-8") as alert_file:
+        alert = json.load(alert_file)
+
+    url = extract_url_from_alert(alert)
+    if not url:
+        debug("# No URL found in this alert. Skipping.")
+        return
+
+    debug(f"# Extracted URL: {url}")
+
+    status, json_response = query_urlhaus(url)
+    debug(f"# URLhaus HTTP status: {status}")
+    debug(f"# URLhaus response status: {json_response.get('query_status')}")
+
+    out = build_output(alert, url, json_response)
+    if not out:
+        debug("# URL not found in URLhaus. No event sent.")
+        return
+
+    send_event(out, alert.get("agent"))
+
 if __name__ == "__main__":
     try:
-        # Read arguments
-        bad_arguments = False
-        if len(sys.argv) >= 4:
-            msg = '{0} {1} {2} {3} {4}'.format(now, sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] if len(sys.argv) > 4 else '')
-            debug_enabled = (len(sys.argv) > 4 and sys.argv[4] == 'debug')
-        else:
-            msg = '{0} Wrong arguments'.format(now)
-            bad_arguments = True
-
-        # Logging the call
-        f = open(log_file, 'a')
-        f.write(msg +'\n')
-        f.close()
-
-        if bad_arguments:
-            debug("# Exiting: Bad arguments.")
-            sys.exit(1)
-
-        # Main function
         main(sys.argv)
-
     except Exception as e:
-        debug(str(e))
+        debug(f"# Fatal error: {e}")
         raise
